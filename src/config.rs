@@ -38,7 +38,7 @@ impl std::fmt::Display for Server {
 
 fn config_dir() -> PathBuf {
     let home = dirs::home_dir().expect("Cannot determine home directory");
-    home.join(".ssh-helper")
+    home.join(".ssh-go")
 }
 
 fn config_path() -> PathBuf {
