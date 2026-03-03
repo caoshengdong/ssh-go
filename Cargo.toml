@@ -1,0 +1,12 @@
+[package]
+name = "sgo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dialoguer = "0.11"
+colored = "2"
+dirs = "5"
