@@ -7,11 +7,23 @@ use colored::Colorize;
 use config::{Auth, Server};
 use dialoguer::{Input, Password, Select};
 
+/// When ssh invokes us as SSH_ASKPASS, just print the password and exit.
+fn maybe_handle_askpass() {
+    if let Ok(pass) = std::env::var("SGO_PASS") {
+        print!("{}", pass);
+        std::process::exit(0);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "sgo", about = "SSH server manager with fuzzy matching")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Print the SSH command instead of executing it (for Warp terminal integration)
+    #[arg(long)]
+    print_ssh: bool,
 
     /// Query to fuzzy-match a server and connect
     query: Option<String>,
@@ -36,6 +48,8 @@ enum Commands {
 }
 
 fn main() {
+    maybe_handle_askpass();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -45,7 +59,11 @@ fn main() {
         Some(Commands::Remove { query }) => cmd_remove(&query),
         None => {
             if let Some(query) = cli.query {
-                cmd_connect(&query);
+                if cli.print_ssh {
+                    cmd_print_ssh(&query);
+                } else {
+                    cmd_connect(&query);
+                }
             } else {
                 // No query and no subcommand — show list
                 cmd_list();
@@ -271,6 +289,37 @@ fn cmd_remove(query: &str) {
     } else {
         println!("{}", "Cancelled.".yellow());
     }
+}
+
+fn cmd_print_ssh(query: &str) {
+    let servers = config::load_servers().unwrap_or_default();
+    if servers.is_empty() {
+        eprintln!("No servers configured. Use `sgo add` to add one.");
+        std::process::exit(1);
+    }
+
+    let matched = matcher::match_servers(&servers, query);
+
+    if matched.is_empty() {
+        eprintln!("No server matching \"{}\"", query);
+        std::process::exit(1);
+    }
+
+    let server = if matched.len() == 1 {
+        matched[0]
+    } else {
+        // Interactive selector writes to stderr, so it won't pollute stdout
+        let items: Vec<String> = matched.iter().map(|s| s.to_string()).collect();
+        let choice = Select::new()
+            .with_prompt("Multiple matches — select a server")
+            .items(&items)
+            .default(0)
+            .interact()
+            .unwrap();
+        matched[choice]
+    };
+
+    ssh::print_command(server);
 }
 
 fn cmd_connect(query: &str) {
