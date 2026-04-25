@@ -1,11 +1,13 @@
 mod config;
 mod matcher;
 mod ssh;
+mod tunnel;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use config::{Auth, Server};
 use dialoguer::{Input, Password, Select};
+use tunnel::TunnelMode;
 
 /// When ssh invokes us as SSH_ASKPASS, just print the password and exit.
 fn maybe_handle_askpass() {
@@ -16,7 +18,18 @@ fn maybe_handle_askpass() {
 }
 
 #[derive(Parser)]
-#[command(name = "sgo", about = "SSH server manager with fuzzy matching")]
+#[command(
+    name = "sgo",
+    about = "SSH server manager with fuzzy matching",
+    long_about = "SSH server manager with fuzzy matching.\n\n\
+        With no subcommand, fuzzy-matches QUERY against saved servers and connects.\n\n\
+        Examples:\n  \
+          sgo                       list all saved servers\n  \
+          sgo prod                  connect to server matching \"prod\"\n  \
+          sgo add                   add a new server interactively\n  \
+          sgo tunnel prod 8080      open a tunnel to prod\n\n\
+        Matching priority: exact alias > IP suffix > alias substring > IP substring."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -45,6 +58,30 @@ enum Commands {
         /// Query to match the server
         query: String,
     },
+    /// Open an SSH tunnel to a server
+    #[command(long_about = "Open an SSH tunnel to a server (runs in foreground, Ctrl+C to close).\n\n\
+        Examples:\n  \
+          sgo tunnel prod 8080                   local:8080 -> prod:8080\n  \
+          sgo tunnel prod 8080:9090              local:8080 -> prod:9090\n  \
+          sgo tunnel prod 8080:db.internal:5432  local:8080 -> db.internal:5432 (via prod)\n  \
+          sgo tunnel prod -d 1080                SOCKS5 proxy on local:1080\n  \
+          sgo tunnel prod -r 8080                prod:8080 -> local:8080\n  \
+          sgo tunnel prod 8080 -vv               enable ssh verbose logging")]
+    Tunnel {
+        /// Query to match the server
+        query: String,
+        /// Port spec: PORT | LOCAL:REMOTE | LOCAL:HOST:REMOTE (or single port with -d/-r)
+        port_spec: String,
+        /// Dynamic forward (SOCKS5 proxy): port_spec is a single local port
+        #[arg(short = 'd', long)]
+        dynamic: bool,
+        /// Reverse forward: port_spec is REMOTE or REMOTE:LOCAL
+        #[arg(short = 'r', long)]
+        reverse: bool,
+        /// Verbose ssh output (-v, -vv, -vvv). Repeat for more detail.
+        #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+        verbose: u8,
+    },
 }
 
 fn main() {
@@ -57,6 +94,13 @@ fn main() {
         Some(Commands::List) => cmd_list(),
         Some(Commands::Edit { query }) => cmd_edit(&query),
         Some(Commands::Remove { query }) => cmd_remove(&query),
+        Some(Commands::Tunnel {
+            query,
+            port_spec,
+            dynamic,
+            reverse,
+            verbose,
+        }) => cmd_tunnel(&query, &port_spec, dynamic, reverse, verbose),
         None => {
             if let Some(query) = cli.query {
                 if cli.print_ssh {
@@ -370,6 +414,135 @@ fn cmd_connect(query: &str) {
     );
 
     ssh::connect(server);
+}
+
+fn cmd_tunnel(query: &str, port_spec: &str, dynamic: bool, reverse: bool, verbose: u8) {
+    if dynamic && reverse {
+        println!(
+            "{} -d and -r cannot be used together",
+            "Error:".red().bold()
+        );
+        return;
+    }
+
+    let mode = if dynamic {
+        match port_spec.parse::<u16>() {
+            Ok(port) => TunnelMode::Dynamic { port },
+            Err(_) => {
+                println!(
+                    "{} invalid port for dynamic forward: \"{}\"",
+                    "Error:".red().bold(),
+                    port_spec
+                );
+                return;
+            }
+        }
+    } else if reverse {
+        let parts: Vec<&str> = port_spec.split(':').collect();
+        match parts.as_slice() {
+            [p] => match p.parse::<u16>() {
+                Ok(port) => TunnelMode::Reverse {
+                    remote_port: port,
+                    local_host: "localhost".to_string(),
+                    local_port: port,
+                },
+                Err(_) => {
+                    println!("{} invalid port: \"{}\"", "Error:".red().bold(), p);
+                    return;
+                }
+            },
+            [r, l] => {
+                let remote = match r.parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        println!("{} invalid port: \"{}\"", "Error:".red().bold(), r);
+                        return;
+                    }
+                };
+                let local = match l.parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        println!("{} invalid port: \"{}\"", "Error:".red().bold(), l);
+                        return;
+                    }
+                };
+                TunnelMode::Reverse {
+                    remote_port: remote,
+                    local_host: "localhost".to_string(),
+                    local_port: local,
+                }
+            }
+            _ => {
+                println!(
+                    "{} invalid reverse spec \"{}\" — expected PORT or REMOTE:LOCAL",
+                    "Error:".red().bold(),
+                    port_spec
+                );
+                return;
+            }
+        }
+    } else {
+        match tunnel::parse_local_spec(port_spec) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("{} {}", "Error:".red().bold(), e);
+                return;
+            }
+        }
+    };
+
+    let servers = config::load_servers().unwrap_or_default();
+    if servers.is_empty() {
+        println!(
+            "{}",
+            "No servers configured. Use `sgo add` to add one.".yellow()
+        );
+        return;
+    }
+
+    let matched = matcher::match_servers(&servers, query);
+
+    if matched.is_empty() {
+        println!(
+            "{} No server matching \"{}\"",
+            "Error:".red().bold(),
+            query
+        );
+        return;
+    }
+
+    let server = if matched.len() == 1 {
+        matched[0]
+    } else {
+        println!(
+            "{} Multiple servers match \"{}\":",
+            "Note:".yellow().bold(),
+            query
+        );
+        let items: Vec<String> = matched.iter().map(|s| s.to_string()).collect();
+        let choice = Select::new()
+            .with_prompt("Select a server")
+            .items(&items)
+            .default(0)
+            .interact()
+            .unwrap();
+        matched[choice]
+    };
+
+    eprintln!(
+        "{} {}",
+        "Tunnel:".green().bold(),
+        mode.describe()
+    );
+    if verbose > 0 {
+        eprintln!(
+            "{} ssh verbose level = {}",
+            "Verbose:".green().bold(),
+            verbose
+        );
+    }
+
+    tunnel::open(server, &mode, verbose);
 }
 
 /// Resolve matched servers to a single index in the original servers vec.
