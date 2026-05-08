@@ -58,6 +58,21 @@ enum Commands {
         /// Query to match the server
         query: String,
     },
+    /// Run a command on a server non-interactively (for scripts and AI tools)
+    #[command(long_about = "Run a command on a server and exit with its exit code.\n\n\
+        Stdout/stderr from the remote command are streamed through. The query must\n\
+        match exactly one server — multiple matches exit with code 2 instead of prompting,\n\
+        so this is safe to call from non-interactive contexts.\n\n\
+        Examples:\n  \
+          sgo exec prod \"uptime\"\n  \
+          sgo exec prod \"tail -n 50 /var/log/syslog\"\n  \
+          sgo exec prod 'df -h | grep /var'")]
+    Exec {
+        /// Query to match the server (must match exactly one)
+        query: String,
+        /// Command to run on the remote (passed as a single shell string)
+        command: String,
+    },
     /// Open an SSH tunnel to a server
     #[command(long_about = "Open an SSH tunnel to a server (runs in foreground, Ctrl+C to close).\n\n\
         Examples:\n  \
@@ -94,6 +109,7 @@ fn main() {
         Some(Commands::List) => cmd_list(),
         Some(Commands::Edit { query }) => cmd_edit(&query),
         Some(Commands::Remove { query }) => cmd_remove(&query),
+        Some(Commands::Exec { query, command }) => cmd_exec(&query, &command),
         Some(Commands::Tunnel {
             query,
             port_spec,
@@ -414,6 +430,38 @@ fn cmd_connect(query: &str) {
     );
 
     ssh::connect(server);
+}
+
+fn cmd_exec(query: &str, command: &str) {
+    let servers = match config::load_servers() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sgo: failed to load config: {}", e);
+            std::process::exit(2);
+        }
+    };
+    if servers.is_empty() {
+        eprintln!("sgo: no servers configured (run `sgo add`)");
+        std::process::exit(2);
+    }
+
+    let matched = matcher::match_servers(&servers, query);
+
+    if matched.is_empty() {
+        eprintln!("sgo: no server matching \"{}\"", query);
+        std::process::exit(2);
+    }
+
+    if matched.len() > 1 {
+        eprintln!("sgo: query \"{}\" matched {} servers — be more specific:", query, matched.len());
+        for s in &matched {
+            eprintln!("  - {}", s.alias);
+        }
+        std::process::exit(2);
+    }
+
+    let code = ssh::run_command(matched[0], command);
+    std::process::exit(code);
 }
 
 fn cmd_tunnel(query: &str, port_spec: &str, dynamic: bool, reverse: bool, verbose: u8) {
