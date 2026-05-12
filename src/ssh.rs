@@ -12,6 +12,42 @@ pub fn connect(server: &Server) -> ! {
     }
 }
 
+/// Run a single command on the server and return its exit code.
+/// stdout and stderr are inherited (passed through to the caller).
+/// `command` is passed as a single argument to ssh, matching `ssh host "cmd"` semantics.
+pub fn run_command(server: &Server, command: &str) -> i32 {
+    let mut cmd = ssh_base(server);
+    // BatchMode lets ssh fail fast on missing keys, but breaks ASKPASS — so only set it
+    // for non-password auth.
+    match &server.auth {
+        Some(Auth::Password(password)) => {
+            let exe = std::env::current_exe().expect("Cannot determine sgo executable path");
+            cmd.env("SGO_PASS", password)
+                .env("SSH_ASKPASS", &exe)
+                .env("SSH_ASKPASS_REQUIRE", "force");
+        }
+        Some(Auth::Key(key_path)) => {
+            cmd.arg("-o").arg("BatchMode=yes").arg("-i").arg(key_path);
+        }
+        None => {
+            cmd.arg("-o").arg("BatchMode=yes");
+        }
+    }
+
+    let status = cmd
+        .arg(format!("{}@{}", server.user, server.host))
+        .arg(command)
+        .status();
+
+    match status {
+        Ok(s) => s.code().unwrap_or(255),
+        Err(e) => {
+            eprintln!("Failed to spawn ssh: {}", e);
+            255
+        }
+    }
+}
+
 fn ssh_base(server: &Server) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-p")
