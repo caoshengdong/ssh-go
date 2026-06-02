@@ -1,45 +1,112 @@
 use crate::config::{Auth, Server};
-use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-/// Connect to a server via SSH.
-/// This function does not return on success (exec replaces the process).
-pub fn connect(server: &Server) -> ! {
-    match &server.auth {
-        Some(Auth::Password(password)) => connect_with_password(server, password),
-        Some(Auth::Key(key_path)) => connect_with_key(server, key_path),
-        None => connect_plain(server),
+/// Shared ssh options applied to every connection.
+fn base_opts(port: u16) -> Vec<String> {
+    vec![
+        "-p".into(),
+        port.to_string(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "ServerAliveInterval=60".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+    ]
+}
+
+/// Force password auth so the PTY runner always sees a prompt (no silent
+/// fallback to a key in the agent / ~/.ssh).
+pub(crate) fn force_password_opts(args: &mut Vec<String>) {
+    args.push("-o".into());
+    args.push("PubkeyAuthentication=no".into());
+    args.push("-o".into());
+    args.push("PreferredAuthentications=password,keyboard-interactive".into());
+}
+
+/// Run a program with an inherited terminal and do not return.
+///
+/// On Unix we `exec()` so ssh fully replaces this process (cleanest signal and
+/// terminal ownership). Windows has no `exec`, so we spawn, wait, and forward
+/// the child's exit code.
+pub(crate) fn exec_or_status(program: &str, args: &[String]) -> ! {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        eprintln!("Failed to exec {}: {}", program, err);
+        std::process::exit(1);
     }
+
+    #[cfg(windows)]
+    {
+        match cmd.status() {
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("Failed to run {}: {}", program, e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Connect to a server via SSH. Does not return on success.
+pub fn connect(server: &Server) -> ! {
+    let mut args = base_opts(server.port);
+
+    match &server.auth {
+        Some(Auth::Password(password)) => {
+            force_password_opts(&mut args);
+            args.push(format!("{}@{}", server.user, server.host));
+            let code = crate::pty::run("ssh", &args, password, true);
+            std::process::exit(code);
+        }
+        Some(Auth::Key(key_path)) => {
+            args.push("-i".into());
+            args.push(key_path.clone());
+        }
+        None => {}
+    }
+
+    args.push(format!("{}@{}", server.user, server.host));
+    exec_or_status("ssh", &args);
 }
 
 /// Run a single command on the server and return its exit code.
 /// stdout and stderr are inherited (passed through to the caller).
 /// `command` is passed as a single argument to ssh, matching `ssh host "cmd"` semantics.
 pub fn run_command(server: &Server, command: &str) -> i32 {
-    let mut cmd = ssh_base(server);
-    // BatchMode lets ssh fail fast on missing keys, but breaks ASKPASS — so only set it
-    // for non-password auth.
+    let mut args = base_opts(server.port);
+
     match &server.auth {
         Some(Auth::Password(password)) => {
-            let exe = std::env::current_exe().expect("Cannot determine sgo executable path");
-            cmd.env("SGO_PASS", password)
-                .env("SSH_ASKPASS", &exe)
-                .env("SSH_ASKPASS_REQUIRE", "force");
+            // Password auth must go through the PTY runner; BatchMode would
+            // suppress the prompt, so we never set it here.
+            force_password_opts(&mut args);
+            args.push(format!("{}@{}", server.user, server.host));
+            args.push(command.to_string());
+            return crate::pty::run("ssh", &args, password, false);
         }
         Some(Auth::Key(key_path)) => {
-            cmd.arg("-o").arg("BatchMode=yes").arg("-i").arg(key_path);
+            // BatchMode lets ssh fail fast on missing keys.
+            args.push("-o".into());
+            args.push("BatchMode=yes".into());
+            args.push("-i".into());
+            args.push(key_path.clone());
         }
         None => {
-            cmd.arg("-o").arg("BatchMode=yes");
+            args.push("-o".into());
+            args.push("BatchMode=yes".into());
         }
     }
 
-    let status = cmd
-        .arg(format!("{}@{}", server.user, server.host))
-        .arg(command)
-        .status();
+    args.push(format!("{}@{}", server.user, server.host));
+    args.push(command.to_string());
 
-    match status {
+    match Command::new("ssh").args(&args).status() {
         Ok(s) => s.code().unwrap_or(255),
         Err(e) => {
             eprintln!("Failed to spawn ssh: {}", e);
@@ -48,101 +115,29 @@ pub fn run_command(server: &Server, command: &str) -> i32 {
     }
 }
 
-fn ssh_base(server: &Server) -> Command {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-p")
-        .arg(server.port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("ServerAliveInterval=60")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3");
-    cmd
-}
-
-fn connect_with_key(server: &Server, key_path: &str) -> ! {
-    let err = ssh_base(server)
-        .arg("-i")
-        .arg(key_path)
-        .arg(format!("{}@{}", server.user, server.host))
-        .exec();
-
-    eprintln!("Failed to exec ssh: {}", err);
-    std::process::exit(1);
-}
-
-fn connect_plain(server: &Server) -> ! {
-    let err = ssh_base(server)
-        .arg(format!("{}@{}", server.user, server.host))
-        .exec();
-
-    eprintln!("Failed to exec ssh: {}", err);
-    std::process::exit(1);
-}
-
 /// Print the equivalent SSH command to stdout (for shell integration with Warp, etc.)
+///
+/// Password auth cannot be embedded safely, so the printed command will prompt
+/// for the password interactively.
 pub fn print_command(server: &Server) {
-    let base = format!(
-        "ssh -p {} -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ServerAliveCountMax=3",
-        server.port
-    );
+    let mut parts = vec!["ssh".to_string()];
+    parts.extend(base_opts(server.port));
 
     match &server.auth {
-        Some(Auth::Password(password)) => {
-            let exe = std::env::current_exe().expect("Cannot determine sgo executable path");
-            println!(
-                "SGO_PASS={} SSH_ASKPASS={} SSH_ASKPASS_REQUIRE=force {} {}@{}",
-                shell_escape(password),
-                shell_escape(&exe.display().to_string()),
-                base,
-                server.user,
-                server.host
-            );
-        }
         Some(Auth::Key(key_path)) => {
-            println!(
-                "{} -i {} {}@{}",
-                base,
-                shell_escape(key_path),
-                server.user,
-                server.host
-            );
+            parts.push("-i".to_string());
+            parts.push(shell_escape(key_path));
         }
-        None => {
-            println!("{} {}@{}", base, server.user, server.host);
+        Some(Auth::Password(_)) => {
+            eprintln!("Note: password auth — ssh will prompt for the password.");
         }
+        None => {}
     }
+
+    parts.push(format!("{}@{}", server.user, server.host));
+    println!("{}", parts.join(" "));
 }
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-fn connect_with_password(server: &Server, password: &str) -> ! {
-    // Use SSH_ASKPASS mechanism: ssh calls our own binary to get the password.
-    // No intermediate pty, no external dependencies.
-    //
-    // How it works:
-    //   1. We set SGO_PASS=<password> in the environment
-    //   2. We set SSH_ASKPASS=<path to our own binary>
-    //   3. We set SSH_ASKPASS_REQUIRE=force (OpenSSH 8.4+)
-    //   4. We exec ssh
-    //   5. When ssh needs a password, it spawns our binary
-    //   6. Our binary sees SGO_PASS, prints it, and exits
-    //   7. ssh reads the password from stdout — done
-    //
-    // The ssh process directly owns the terminal. No pty wrapper, no freeze.
-
-    let exe = std::env::current_exe().expect("Cannot determine sgo executable path");
-
-    let err = ssh_base(server)
-        .env("SGO_PASS", password)
-        .env("SSH_ASKPASS", &exe)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .arg(format!("{}@{}", server.user, server.host))
-        .exec();
-
-    eprintln!("Failed to exec ssh: {}", err);
-    std::process::exit(1);
 }

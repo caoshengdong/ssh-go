@@ -1,7 +1,5 @@
 use crate::config::{Auth, Server};
 use colored::Colorize;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 
 pub enum TunnelMode {
     /// -L local:host:remote
@@ -45,26 +43,27 @@ impl TunnelMode {
         }
     }
 
-    fn apply(&self, cmd: &mut Command) {
+    fn apply(&self, args: &mut Vec<String>) {
         match self {
             TunnelMode::Local {
                 local_port,
                 remote_host,
                 remote_port,
             } => {
-                cmd.arg("-L")
-                    .arg(format!("{}:{}:{}", local_port, remote_host, remote_port));
+                args.push("-L".into());
+                args.push(format!("{}:{}:{}", local_port, remote_host, remote_port));
             }
             TunnelMode::Reverse {
                 remote_port,
                 local_host,
                 local_port,
             } => {
-                cmd.arg("-R")
-                    .arg(format!("{}:{}:{}", remote_port, local_host, local_port));
+                args.push("-R".into());
+                args.push(format!("{}:{}:{}", remote_port, local_host, local_port));
             }
             TunnelMode::Dynamic { port } => {
-                cmd.arg("-D").arg(port.to_string());
+                args.push("-D".into());
+                args.push(port.to_string());
             }
         }
     }
@@ -111,98 +110,68 @@ pub fn parse_local_spec(spec: &str) -> Result<TunnelMode, String> {
 /// Verbosity level for ssh itself: 0 = off, 1 = -v, 2 = -vv, 3 = -vvv.
 pub type Verbosity = u8;
 
-/// Open an SSH tunnel. Does not return on success (exec replaces the process).
+/// Open an SSH tunnel. Does not return on success.
 pub fn open(server: &Server, mode: &TunnelMode, verbose: Verbosity) -> ! {
-    let mut cmd = tunnel_base(server, verbose);
-    mode.apply(&mut cmd);
+    let mut args = tunnel_base(server, verbose);
+    mode.apply(&mut args);
 
     match &server.auth {
         Some(Auth::Password(password)) => {
-            let exe = std::env::current_exe().expect("Cannot determine sgo executable path");
-            cmd.env("SGO_PASS", password)
-                .env("SSH_ASKPASS", &exe)
-                .env("SSH_ASKPASS_REQUIRE", "force")
-                .arg(format!("{}@{}", server.user, server.host));
+            crate::ssh::force_password_opts(&mut args);
+            args.push(format!("{}@{}", server.user, server.host));
+            log_command(&args, server);
+            eprintln!("{}", "Executing ssh (Ctrl+C to close tunnel)...".dimmed());
+            // raw = false: a tunnel has no interactive shell, and we want Ctrl+C
+            // to raise a signal that tears the tunnel down.
+            let code = crate::pty::run("ssh", &args, password, false);
+            std::process::exit(code);
         }
         Some(Auth::Key(key_path)) => {
-            cmd.arg("-i")
-                .arg(key_path)
-                .arg(format!("{}@{}", server.user, server.host));
+            args.push("-i".into());
+            args.push(key_path.clone());
+            args.push(format!("{}@{}", server.user, server.host));
         }
         None => {
-            cmd.arg(format!("{}@{}", server.user, server.host));
+            args.push(format!("{}@{}", server.user, server.host));
         }
-    };
+    }
 
-    log_command(&cmd, server);
+    log_command(&args, server);
     eprintln!("{}", "Executing ssh (Ctrl+C to close tunnel)...".dimmed());
-
-    let err = cmd.exec();
-    eprintln!("{} failed to exec ssh: {}", "Error:".red().bold(), err);
-    std::process::exit(1);
+    crate::ssh::exec_or_status("ssh", &args);
 }
 
-fn tunnel_base(server: &Server, verbose: Verbosity) -> Command {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-N")
-        .arg("-p")
-        .arg(server.port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("ServerAliveInterval=60")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes");
+fn tunnel_base(server: &Server, verbose: Verbosity) -> Vec<String> {
+    let mut args = vec![
+        "-N".into(),
+        "-p".into(),
+        server.port.to_string(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "ServerAliveInterval=60".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+    ];
 
     match verbose {
         0 => {}
-        1 => {
-            cmd.arg("-v");
-        }
-        2 => {
-            cmd.arg("-vv");
-        }
-        _ => {
-            cmd.arg("-vvv");
-        }
+        1 => args.push("-v".into()),
+        2 => args.push("-vv".into()),
+        _ => args.push("-vvv".into()),
     }
-    cmd
+    args
 }
 
-/// Print the ssh command to stderr, with passwords redacted.
-fn log_command(cmd: &Command, server: &Server) {
-    let program = cmd.get_program().to_string_lossy();
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| shell_escape(&a.to_string_lossy()))
-        .collect();
-
-    let env_prefix: Vec<String> = cmd
-        .get_envs()
-        .filter_map(|(k, v)| {
-            let key = k.to_string_lossy().into_owned();
-            let val = v?.to_string_lossy().into_owned();
-            let display = if key == "SGO_PASS" {
-                "<redacted>".to_string()
-            } else {
-                shell_escape(&val)
-            };
-            Some(format!("{}={}", key, display))
-        })
-        .collect();
-
-    let mut line = String::new();
-    if !env_prefix.is_empty() {
-        line.push_str(&env_prefix.join(" "));
-        line.push(' ');
-    }
-    line.push_str(&program);
-    if !args.is_empty() {
-        line.push(' ');
-        line.push_str(&args.join(" "));
-    }
+/// Print the ssh command to stderr. The password is fed via the PTY runner and
+/// never appears in the argument list.
+fn log_command(args: &[String], server: &Server) {
+    let line = std::iter::once("ssh".to_string())
+        .chain(args.iter().map(|a| shell_escape(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     eprintln!(
         "{} {}@{} via port {}",

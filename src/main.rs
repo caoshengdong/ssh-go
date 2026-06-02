@@ -1,5 +1,6 @@
 mod config;
 mod matcher;
+mod pty;
 mod ssh;
 mod tunnel;
 
@@ -8,14 +9,6 @@ use colored::Colorize;
 use config::{Auth, Server};
 use dialoguer::{Input, Password, Select};
 use tunnel::TunnelMode;
-
-/// When ssh invokes us as SSH_ASKPASS, just print the password and exit.
-fn maybe_handle_askpass() {
-    if let Ok(pass) = std::env::var("SGO_PASS") {
-        print!("{}", pass);
-        std::process::exit(0);
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -100,8 +93,6 @@ enum Commands {
 }
 
 fn main() {
-    maybe_handle_askpass();
-
     let cli = Cli::parse();
 
     match cli.command {
