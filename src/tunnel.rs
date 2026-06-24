@@ -1,6 +1,8 @@
 use crate::config::{Auth, Server};
 use colored::Colorize;
+use std::path::PathBuf;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum TunnelMode {
     /// -L local:host:remote
     Local {
@@ -110,7 +112,7 @@ pub fn parse_local_spec(spec: &str) -> Result<TunnelMode, String> {
 /// Verbosity level for ssh itself: 0 = off, 1 = -v, 2 = -vv, 3 = -vvv.
 pub type Verbosity = u8;
 
-/// Open an SSH tunnel. Does not return on success.
+/// Open an SSH tunnel and exit with ssh's exit code when it closes.
 pub fn open(server: &Server, mode: &TunnelMode, verbose: Verbosity) -> ! {
     let mut args = tunnel_base(server, verbose);
     mode.apply(&mut args);
@@ -128,7 +130,7 @@ pub fn open(server: &Server, mode: &TunnelMode, verbose: Verbosity) -> ! {
         }
         Some(Auth::Key(key_path)) => {
             args.push("-i".into());
-            args.push(key_path.clone());
+            args.push(expand_path(key_path).display().to_string());
             args.push(format!("{}@{}", server.user, server.host));
         }
         None => {
@@ -184,9 +186,91 @@ fn log_command(args: &[String], server: &Server) {
 }
 
 fn shell_escape(s: &str) -> String {
-    if s.chars().all(|c| c.is_alphanumeric() || "-_./:@=".contains(c)) {
+    if is_shell_safe(s) {
         s.to_string()
     } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
+        #[cfg(windows)]
+        {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+
+        #[cfg(not(windows))]
+        {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=+,%\\".contains(c))
+}
+
+#[cfg(not(windows))]
+fn is_shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=+,%".contains(c))
+}
+
+fn expand_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return dirs::home_dir()
+            .map(|home| join_path_segments(home, rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    PathBuf::from(path)
+}
+
+fn join_path_segments(mut base: PathBuf, rest: &str) -> PathBuf {
+    for part in rest.split(['/', '\\']).filter(|part| !part.is_empty()) {
+        base.push(part);
+    }
+    base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_local_tunnel_specs() {
+        assert_eq!(
+            parse_local_spec("8080").unwrap(),
+            TunnelMode::Local {
+                local_port: 8080,
+                remote_host: "localhost".to_string(),
+                remote_port: 8080,
+            }
+        );
+        assert_eq!(
+            parse_local_spec("8080:9090").unwrap(),
+            TunnelMode::Local {
+                local_port: 8080,
+                remote_host: "localhost".to_string(),
+                remote_port: 9090,
+            }
+        );
+        assert_eq!(
+            parse_local_spec("8080:db.internal:5432").unwrap(),
+            TunnelMode::Local {
+                local_port: 8080,
+                remote_host: "db.internal".to_string(),
+                remote_port: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_local_tunnel_specs() {
+        assert!(parse_local_spec("not-a-port").is_err());
+        assert!(parse_local_spec("8080:9090:too:many").is_err());
     }
 }

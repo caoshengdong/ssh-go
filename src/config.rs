@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+const CONFIG_DIR_ENV: &str = "SGO_CONFIG_DIR";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub alias: String,
@@ -37,6 +39,12 @@ impl std::fmt::Display for Server {
 }
 
 fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var(CONFIG_DIR_ENV) {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+
     let home = dirs::home_dir().expect("Cannot determine home directory");
     home.join(".ssh-go")
 }
@@ -51,9 +59,12 @@ pub fn load_servers() -> io::Result<Vec<Server>> {
         return Ok(Vec::new());
     }
     let data = fs::read_to_string(&path)?;
-    let servers: Vec<Server> =
-        serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(servers)
+    parse_servers(&data)
+}
+
+fn parse_servers(data: &str) -> io::Result<Vec<Server>> {
+    let data = data.strip_prefix('\u{feff}').unwrap_or(data);
+    serde_json::from_str(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub fn save_servers(servers: &[Server]) -> io::Result<()> {
@@ -68,8 +79,7 @@ pub fn save_servers(servers: &[Server]) -> io::Result<()> {
     }
 
     let path = config_path();
-    let data = serde_json::to_string_pretty(servers)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let data = serde_json::to_string_pretty(servers).map_err(io::Error::other)?;
     fs::write(&path, data)?;
 
     #[cfg(unix)]
@@ -79,4 +89,20 @@ pub fn save_servers(servers: &[Server]) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_servers_with_utf8_bom() {
+        let servers = parse_servers(
+            "\u{feff}[{\"alias\":\"prod\",\"host\":\"127.0.0.1\",\"port\":22,\"user\":\"root\",\"auth\":null}]",
+        )
+        .unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].alias, "prod");
+    }
 }

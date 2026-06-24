@@ -19,10 +19,7 @@ pub fn match_servers<'a>(servers: &'a [Server], query: &str) -> Vec<&'a Server> 
     }
 
     // 2. IP suffix match
-    let ip_suffix: Vec<&Server> = servers
-        .iter()
-        .filter(|s| s.host.ends_with(query))
-        .collect();
+    let ip_suffix: Vec<&Server> = servers.iter().filter(|s| s.host.ends_with(query)).collect();
     if !ip_suffix.is_empty() {
         return ip_suffix;
     }
@@ -37,9 +34,51 @@ pub fn match_servers<'a>(servers: &'a [Server], query: &str) -> Vec<&'a Server> 
     }
 
     // 4. IP substring match
-    let ip_sub: Vec<&Server> = servers
-        .iter()
-        .filter(|s| s.host.contains(query))
-        .collect();
+    let ip_sub: Vec<&Server> = servers.iter().filter(|s| s.host.contains(query)).collect();
     ip_sub
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(alias: &str, host: &str) -> Server {
+        Server {
+            alias: alias.to_string(),
+            host: host.to_string(),
+            port: 22,
+            user: "root".to_string(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn exact_alias_match_has_highest_priority() {
+        let servers = vec![server("prod", "10.0.0.10"), server("prod-db", "prod")];
+
+        let matched = match_servers(&servers, "prod");
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].alias, "prod");
+    }
+
+    #[test]
+    fn falls_back_through_suffix_alias_and_host_substring() {
+        let servers = vec![
+            server("web", "192.168.1.42"),
+            server("prod-db", "10.0.0.15"),
+            server("cache", "172.16.20.30"),
+        ];
+
+        assert_eq!(match_servers(&servers, ".42")[0].alias, "web");
+        assert_eq!(match_servers(&servers, "DB")[0].alias, "prod-db");
+        assert_eq!(match_servers(&servers, "16.20")[0].alias, "cache");
+    }
+
+    #[test]
+    fn returns_empty_when_nothing_matches() {
+        let servers = vec![server("prod", "10.0.0.10")];
+
+        assert!(match_servers(&servers, "missing").is_empty());
+    }
 }
