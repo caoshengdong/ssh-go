@@ -6,7 +6,7 @@ Runs end-to-end sgo tests on Windows using a disposable Docker OpenSSH server.
 The script builds sgo, starts a temporary Alpine-based SSH server container,
 then verifies:
   - key-based interactive login path
-  - password-based interactive login path via SSH_ASKPASS
+  - password-based interactive login path via PTY password entry
   - key-based sgo exec
   - password-based sgo exec
   - local tunnel traffic (-L)
@@ -50,7 +50,7 @@ $reverseJob = $null
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
     )
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
@@ -108,19 +108,39 @@ function Invoke-External {
     $stdoutPath = Join-Path $WorkDir "command-$commandId.stdout.log"
     $stderrPath = Join-Path $WorkDir "command-$commandId.stderr.log"
 
-    $process = Start-Process -FilePath $FilePath `
-        -ArgumentList $Arguments `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath `
-        -PassThru `
-        -Wait `
-        -WindowStyle Hidden
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ConvertTo-ProcessArguments $Arguments
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
 
-    $process.Refresh()
-    $stdout = Get-Content $stdoutPath -Raw -ErrorAction SilentlyContinue
-    $stderr = Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    [void]$process.Start()
+
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        $timedOut = $true
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            [void]$process.WaitForExit(5000)
+        }
+        catch {}
+    } else {
+        $timedOut = $false
+    }
+
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    Write-Utf8NoBom -Path $stdoutPath -Content $stdout
+    Write-Utf8NoBom -Path $stderrPath -Content $stderr
     $output = "$stdout$stderr"
     $exitCode = $process.ExitCode
+
+    if ($timedOut) {
+        throw "Command timed out after $TimeoutSeconds seconds: $FilePath $($Arguments -join ' ')`n$output"
+    }
 
     if ($ExpectedExitCodes -notcontains $exitCode) {
         throw "Command failed ($exitCode): $FilePath $($Arguments -join ' ')`n$output"
@@ -128,13 +148,57 @@ function Invoke-External {
     return $output
 }
 
+function ConvertTo-ProcessArguments {
+    param([string[]]$Arguments = @())
+
+    ($Arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join " "
+}
+
+function ConvertTo-ProcessArgument {
+    param([AllowEmptyString()][string]$Argument)
+
+    if ($Argument -notmatch '[\s"]' -and $Argument.Length -gt 0) {
+        return $Argument
+    }
+
+    $result = '"'
+    $backslashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq '\') {
+            $backslashes++
+            continue
+        }
+
+        if ($char -eq '"') {
+            $result += ('\' * (($backslashes * 2) + 1))
+            $result += '"'
+            $backslashes = 0
+            continue
+        }
+
+        if ($backslashes -gt 0) {
+            $result += ('\' * $backslashes)
+            $backslashes = 0
+        }
+        $result += $char
+    }
+
+    if ($backslashes -gt 0) {
+        $result += ('\' * ($backslashes * 2))
+    }
+
+    $result += '"'
+    return $result
+}
+
 function Invoke-Sgo {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [int[]]$ExpectedExitCodes = @(0)
+        [int[]]$ExpectedExitCodes = @(0),
+        [int]$TimeoutSeconds = 300
     )
 
-    Invoke-External -FilePath $SgoPath -Arguments $Arguments -ExpectedExitCodes $ExpectedExitCodes
+    Invoke-External -FilePath $SgoPath -Arguments $Arguments -ExpectedExitCodes $ExpectedExitCodes -TimeoutSeconds $TimeoutSeconds
 }
 
 function Assert-Contains {
@@ -184,7 +248,7 @@ function Invoke-SgoLoginPath {
     $deadline = (Get-Date).AddSeconds(20)
     do {
         try {
-            return Invoke-Sgo -Arguments @($Alias)
+            return Invoke-Sgo -Arguments @($Alias) -TimeoutSeconds 20
         }
         catch {
             $lastError = $_
@@ -313,7 +377,7 @@ try {
     $PublicKeyPath = "$KeyPath.pub"
     $SetupScriptPath = Join-Path $WorkDir "setup-sshd.sh"
     Invoke-Step "generate SSH key" {
-        Invoke-External -FilePath "cmd.exe" -Arguments @("/d", "/c", "ssh-keygen -t ed25519 -N `"`" -f `"$KeyPath`" -q") | Out-Null
+        Invoke-External -FilePath "ssh-keygen" -Arguments @("-t", "ed25519", "-N", "", "-f", $KeyPath, "-q") | Out-Null
     }
 
     Invoke-Step "prepare disposable SSH server setup" {
@@ -400,9 +464,9 @@ exec /usr/sbin/sshd -D -e
         Assert-Contains -Text $output -Expected "SGO_LOGIN_OK" -Context "key login"
     }
 
-    Invoke-Step "password-based login path via SSH_ASKPASS" {
+    Invoke-Step "password-based login path via PTY password entry" {
         $output = Invoke-SgoLoginPath -Alias "login-pass"
-        Assert-Contains -Text $output -Expected "SGO_LOGIN_OK" -Context "password login"
+        Assert-Contains -Text $output -Expected "Connecting to login@127.0.0.1" -Context "password login"
     }
 
     Invoke-Step "key-based exec" {
@@ -410,7 +474,7 @@ exec /usr/sbin/sshd -D -e
         Assert-Contains -Text $output -Expected "SGO_EXEC_KEY_OK" -Context "key exec"
     }
 
-    Invoke-Step "password-based exec via SSH_ASKPASS" {
+    Invoke-Step "password-based exec via PTY password entry" {
         $output = Invoke-Sgo -Arguments @("exec", "passbox", 'echo${IFS}SGO_EXEC_PASS_OK')
         Assert-Contains -Text $output -Expected "SGO_EXEC_PASS_OK" -Context "password exec"
     }

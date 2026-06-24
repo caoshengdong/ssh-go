@@ -79,7 +79,7 @@ If multiple servers match, you'll be prompted to select one.
 
 Three methods are supported when adding a server:
 
-- **Password** — stored locally, auto-filled through OpenSSH `SSH_ASKPASS`
+- **Password** — stored locally, auto-filled through a PTY-backed OpenSSH session
 - **SSH Key** — connects with `-i <keyfile>`
 - **None** — plain `ssh` connection
 
