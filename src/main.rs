@@ -10,9 +10,16 @@ use config::{Auth, Server};
 use dialoguer::{Input, Password, Select};
 use tunnel::TunnelMode;
 
+fn default_key_path() -> String {
+    dirs::home_dir()
+        .map(|home| home.join(".ssh").join("id_rsa").display().to_string())
+        .unwrap_or_else(|| "~/.ssh/id_rsa".to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "sgo",
+    version,
     about = "SSH server manager with fuzzy matching",
     long_about = "SSH server manager with fuzzy matching.\n\n\
         With no subcommand, fuzzy-matches QUERY against saved servers and connects.\n\n\
@@ -52,14 +59,16 @@ enum Commands {
         query: String,
     },
     /// Run a command on a server non-interactively (for scripts and AI tools)
-    #[command(long_about = "Run a command on a server and exit with its exit code.\n\n\
+    #[command(
+        long_about = "Run a command on a server and exit with its exit code.\n\n\
         Stdout/stderr from the remote command are streamed through. The query must\n\
         match exactly one server — multiple matches exit with code 2 instead of prompting,\n\
         so this is safe to call from non-interactive contexts.\n\n\
         Examples:\n  \
           sgo exec prod \"uptime\"\n  \
           sgo exec prod \"tail -n 50 /var/log/syslog\"\n  \
-          sgo exec prod 'df -h | grep /var'")]
+          sgo exec prod 'df -h | grep /var'"
+    )]
     Exec {
         /// Query to match the server (must match exactly one)
         query: String,
@@ -67,14 +76,16 @@ enum Commands {
         command: String,
     },
     /// Open an SSH tunnel to a server
-    #[command(long_about = "Open an SSH tunnel to a server (runs in foreground, Ctrl+C to close).\n\n\
+    #[command(
+        long_about = "Open an SSH tunnel to a server (runs in foreground, Ctrl+C to close).\n\n\
         Examples:\n  \
           sgo tunnel prod 8080                   local:8080 -> prod:8080\n  \
           sgo tunnel prod 8080:9090              local:8080 -> prod:9090\n  \
           sgo tunnel prod 8080:db.internal:5432  local:8080 -> db.internal:5432 (via prod)\n  \
           sgo tunnel prod -d 1080                SOCKS5 proxy on local:1080\n  \
           sgo tunnel prod -r 8080                prod:8080 -> local:8080\n  \
-          sgo tunnel prod 8080 -vv               enable ssh verbose logging")]
+          sgo tunnel prod 8080 -vv               enable ssh verbose logging"
+    )]
     Tunnel {
         /// Query to match the server
         query: String,
@@ -126,10 +137,7 @@ fn main() {
 fn cmd_add() {
     println!("{}", "Add a new SSH server".green().bold());
 
-    let alias: String = Input::new()
-        .with_prompt("Alias")
-        .interact_text()
-        .unwrap();
+    let alias: String = Input::new().with_prompt("Alias").interact_text().unwrap();
 
     let host: String = Input::new()
         .with_prompt("Host (IP or hostname)")
@@ -158,16 +166,13 @@ fn cmd_add() {
 
     let auth = match auth_choice {
         0 => {
-            let pw: String = Password::new()
-                .with_prompt("Password")
-                .interact()
-                .unwrap();
+            let pw: String = Password::new().with_prompt("Password").interact().unwrap();
             Some(Auth::Password(pw))
         }
         1 => {
             let key: String = Input::new()
                 .with_prompt("Key file path")
-                .default("~/.ssh/id_rsa".to_string())
+                .default(default_key_path())
                 .interact_text()
                 .unwrap();
             Some(Auth::Key(key))
@@ -184,11 +189,7 @@ fn cmd_add() {
     };
 
     let mut servers = config::load_servers().unwrap_or_default();
-    println!(
-        "{} {}",
-        "Added:".green().bold(),
-        server.to_string().white()
-    );
+    println!("{} {}", "Added:".green().bold(), server.to_string().white());
     servers.push(server);
     config::save_servers(&servers).expect("Failed to save config");
 }
@@ -277,16 +278,13 @@ fn cmd_edit(query: &str) {
 
     let auth = match auth_choice {
         0 => {
-            let pw: String = Password::new()
-                .with_prompt("Password")
-                .interact()
-                .unwrap();
+            let pw: String = Password::new().with_prompt("Password").interact().unwrap();
             Some(Auth::Password(pw))
         }
         1 => {
             let default_key = match &server.auth {
                 Some(Auth::Key(k)) => k.clone(),
-                _ => "~/.ssh/id_rsa".to_string(),
+                _ => default_key_path(),
             };
             let key: String = Input::new()
                 .with_prompt("Key file path")
@@ -386,11 +384,7 @@ fn cmd_connect(query: &str) {
     let matched = matcher::match_servers(&servers, query);
 
     if matched.is_empty() {
-        println!(
-            "{} No server matching \"{}\"",
-            "Error:".red().bold(),
-            query
-        );
+        println!("{} No server matching \"{}\"", "Error:".red().bold(), query);
         return;
     }
 
@@ -444,7 +438,11 @@ fn cmd_exec(query: &str, command: &str) {
     }
 
     if matched.len() > 1 {
-        eprintln!("sgo: query \"{}\" matched {} servers — be more specific:", query, matched.len());
+        eprintln!(
+            "sgo: query \"{}\" matched {} servers — be more specific:",
+            query,
+            matched.len()
+        );
         for s in &matched {
             eprintln!("  - {}", s.alias);
         }
@@ -542,11 +540,7 @@ fn cmd_tunnel(query: &str, port_spec: &str, dynamic: bool, reverse: bool, verbos
     let matched = matcher::match_servers(&servers, query);
 
     if matched.is_empty() {
-        println!(
-            "{} No server matching \"{}\"",
-            "Error:".red().bold(),
-            query
-        );
+        println!("{} No server matching \"{}\"", "Error:".red().bold(), query);
         return;
     }
 
@@ -568,11 +562,7 @@ fn cmd_tunnel(query: &str, port_spec: &str, dynamic: bool, reverse: bool, verbos
         matched[choice]
     };
 
-    eprintln!(
-        "{} {}",
-        "Tunnel:".green().bold(),
-        mode.describe()
-    );
+    eprintln!("{} {}", "Tunnel:".green().bold(), mode.describe());
     if verbose > 0 {
         eprintln!(
             "{} ssh verbose level = {}",
@@ -588,11 +578,7 @@ fn cmd_tunnel(query: &str, port_spec: &str, dynamic: bool, reverse: bool, verbos
 /// Returns None if no match or user cancels.
 fn resolve_single(servers: &[Server], matched: &[&Server], query: &str) -> Option<usize> {
     if matched.is_empty() {
-        println!(
-            "{} No server matching \"{}\"",
-            "Error:".red().bold(),
-            query
-        );
+        println!("{} No server matching \"{}\"", "Error:".red().bold(), query);
         return None;
     }
 
@@ -615,7 +601,5 @@ fn resolve_single(servers: &[Server], matched: &[&Server], query: &str) -> Optio
     };
 
     // Find index by pointer equality
-    servers
-        .iter()
-        .position(|s| std::ptr::eq(s, target))
+    servers.iter().position(|s| std::ptr::eq(s, target))
 }
