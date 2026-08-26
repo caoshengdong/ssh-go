@@ -61,19 +61,25 @@ enum Commands {
     /// Run a command on a server non-interactively (for scripts and AI tools)
     #[command(
         long_about = "Run a command on a server and exit with its exit code.\n\n\
-        Stdout/stderr from the remote command are streamed through. The query must\n\
-        match exactly one server — multiple matches exit with code 2 instead of prompting,\n\
-        so this is safe to call from non-interactive contexts.\n\n\
+        Stdout/stderr from the remote command are streamed through byte for byte. The\n\
+        query must match exactly one server — multiple matches exit with code 2 instead\n\
+        of prompting, so this is safe to call from non-interactive contexts.\n\n\
+        One argument is handed to the remote shell as-is, so pipes, redirects and globs\n\
+        work. Several arguments (after `--`) are quoted individually and reach the remote\n\
+        command exactly as typed — no second round of word splitting.\n\n\
+        Local stdin is forwarded unless it is a terminal, so heredocs and pipes work.\n\n\
         Examples:\n  \
           sgo exec prod \"uptime\"\n  \
-          sgo exec prod \"tail -n 50 /var/log/syslog\"\n  \
-          sgo exec prod 'df -h | grep /var'"
+          sgo exec prod 'df -h | grep /var'\n  \
+          sgo exec prod -- grep \"hello world\" /var/log/app.log\n  \
+          sgo exec prod 'bash -s' <<'EOF' ... EOF"
     )]
     Exec {
         /// Query to match the server (must match exactly one)
         query: String,
-        /// Command to run on the remote (passed as a single shell string)
-        command: String,
+        /// Command to run: one shell string, or an argv after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
     },
     /// Open an SSH tunnel to a server
     #[command(
@@ -417,7 +423,7 @@ fn cmd_connect(query: &str) {
     ssh::connect(server);
 }
 
-fn cmd_exec(query: &str, command: &str) {
+fn cmd_exec(query: &str, command: &[String]) {
     let servers = match config::load_servers() {
         Ok(s) => s,
         Err(e) => {
