@@ -80,6 +80,16 @@ sgo remove myserver
 sgo exec prod "uptime"
 sgo exec prod 'df -h | grep /var'
 
+# Pass an argv after `--`: each argument is quoted for the remote shell, so
+# spaces, globs and $ survive exactly as typed
+sgo exec prod -- grep "hello world" /var/log/app.log
+
+# stdin is forwarded, so heredocs and pipes work — and stay byte-exact
+sgo exec prod 'bash -s' <<'EOF'
+echo "runs on the remote"
+EOF
+sgo exec prod "cat > /remote/file" < ./local/file
+
 # Open SSH tunnels
 sgo tunnel prod 8080
 sgo tunnel prod 8080:9090
@@ -115,6 +125,12 @@ sgo remove myserver
 # Run a remote command non-interactively
 sgo exec prod "uptime"
 sgo exec prod 'df -h | grep /var'
+
+# Pass an argv after `--` to keep quoting exactly as typed
+sgo exec prod -- grep "hello world" /var/log/app.log
+
+# Note: on Windows, password auth runs ssh inside ConPTY, which rewrites `\n`
+# as `\r\n` in the remote's output. Use key auth when you need it byte-exact.
 
 # Open SSH tunnels
 sgo tunnel prod 8080
