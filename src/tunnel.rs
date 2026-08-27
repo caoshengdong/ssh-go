@@ -123,9 +123,18 @@ pub fn open(server: &Server, mode: &TunnelMode, verbose: Verbosity) -> ! {
             args.push(format!("{}@{}", server.user, server.host));
             log_command(&args, server);
             eprintln!("{}", "Executing ssh (Ctrl+C to close tunnel)...".dimmed());
-            // raw = false: a tunnel has no interactive shell, and we want Ctrl+C
-            // to raise a signal that tears the tunnel down.
-            let code = crate::pty::run("ssh", &args, password, false);
+            // Not interactive: a tunnel has no shell, and we want Ctrl+C to
+            // raise a signal that tears the tunnel down. It has no use for
+            // stdin either — `-N` means ssh never opens a session channel.
+            let code = crate::pty::run(
+                "ssh",
+                &args,
+                password,
+                crate::pty::Opts {
+                    mode: crate::pty::Mode::Tunnel,
+                    forward_stdin: false,
+                },
+            );
             std::process::exit(code);
         }
         Some(Auth::Key(key_path)) => {

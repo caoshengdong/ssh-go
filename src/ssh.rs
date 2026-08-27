@@ -1,4 +1,5 @@
 use crate::config::{Auth, Server};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -65,7 +66,21 @@ pub fn connect(server: &Server) -> ! {
         Some(Auth::Password(password)) => {
             force_password_opts(&mut args);
             args.push(format!("{}@{}", server.user, server.host));
-            let code = crate::pty::run("ssh", &args, password, !no_tty_requested());
+            let code = crate::pty::run(
+                "ssh",
+                &args,
+                password,
+                crate::pty::Opts {
+                    // With `-T` there is no remote tty and the session is a
+                    // plain data pipe, which is what `Command` describes.
+                    mode: if no_tty_requested() {
+                        crate::pty::Mode::Command
+                    } else {
+                        crate::pty::Mode::Shell
+                    },
+                    forward_stdin: true,
+                },
+            );
             std::process::exit(code);
         }
         Some(Auth::Key(key_path)) => {
@@ -81,20 +96,38 @@ pub fn connect(server: &Server) -> ! {
 
 /// Run a single command on the server and return its exit code.
 /// stdout and stderr are inherited (passed through to the caller).
-/// `command` is passed as a single argument to ssh, matching `ssh host "cmd"` semantics.
-pub fn run_command(server: &Server, command: &str) -> i32 {
+/// The command reaches the remote as one string, matching `ssh host "cmd"`
+/// semantics — see `build_remote_command` for how `command_parts` becomes it.
+///
+/// Local stdin is forwarded unless it is a terminal, so `sgo exec host 'bash -s'
+/// <<'EOF'` feeds the remote the way the same heredoc would feed `ssh`.
+pub fn run_command(server: &Server, command_parts: &[String]) -> i32 {
+    let command = build_remote_command(command_parts);
+    let forward_stdin = !std::io::stdin().is_terminal();
+
     let mut args = base_opts(server.port);
-    // Do not read local stdin for script/AI-tool exec calls. This prevents ssh
-    // from hanging after the remote command exits in non-interactive contexts.
-    args.push("-n".into());
+    // A terminal's keystrokes belong to the user, not to this command: keep ssh
+    // off stdin unless something was actually piped or redirected in. `-n` also
+    // stops ssh from blocking on a stdin nobody will ever close.
+    if !forward_stdin {
+        args.push("-n".into());
+    }
     apply_connect_options(&mut args);
 
     match &server.auth {
         Some(Auth::Password(password)) => {
             force_password_opts(&mut args);
             args.push(format!("{}@{}", server.user, server.host));
-            args.push(command.to_string());
-            return crate::pty::run("ssh", &args, password, false);
+            args.push(command);
+            return crate::pty::run(
+                "ssh",
+                &args,
+                password,
+                crate::pty::Opts {
+                    mode: crate::pty::Mode::Command,
+                    forward_stdin,
+                },
+            );
         }
         Some(Auth::Key(key_path)) => {
             args.push("-o".into());
@@ -109,14 +142,48 @@ pub fn run_command(server: &Server, command: &str) -> i32 {
     }
 
     args.push(format!("{}@{}", server.user, server.host));
-    args.push(command.to_string());
+    args.push(command);
 
+    // stdin is inherited, so a heredoc or pipe reaches the remote command.
     match Command::new("ssh").args(&args).status() {
         Ok(s) => s.code().unwrap_or(255),
         Err(e) => {
             eprintln!("Failed to spawn ssh: {}", e);
             255
         }
+    }
+}
+
+/// Build the single command string ssh hands to the remote shell.
+///
+/// One part is passed through verbatim, so `sgo exec host "a | b"` keeps
+/// behaving like `ssh host "a | b"` — pipes, redirects and globs are the remote
+/// shell's to interpret. Several parts are quoted individually, which is the
+/// point of the `--` form: what the local shell handed to sgo is exactly what
+/// the remote command receives, with no second round of word splitting or glob
+/// expansion to lose quotes and spaces in.
+fn build_remote_command(parts: &[String]) -> String {
+    match parts {
+        [single] => single.clone(),
+        _ => parts
+            .iter()
+            .map(|p| posix_quote(p))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Quote a single argument for the remote shell. Always POSIX: the shell on the
+/// far end is the server's, whatever the client happens to run.
+fn posix_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=+,%".contains(c));
+
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -238,6 +305,37 @@ mod tests {
 
         #[cfg(not(windows))]
         assert_eq!(shell_escape("a b'c"), "'a b'\\''c'");
+    }
+
+    #[test]
+    fn single_command_part_reaches_the_remote_shell_untouched() {
+        let parts = vec!["df -h | grep /var".to_string()];
+        assert_eq!(build_remote_command(&parts), "df -h | grep /var");
+    }
+
+    #[test]
+    fn multiple_command_parts_are_quoted_individually() {
+        let parts = vec![
+            "grep".to_string(),
+            "hello world".to_string(),
+            "/var/log/app.log".to_string(),
+        ];
+        assert_eq!(
+            build_remote_command(&parts),
+            "grep 'hello world' /var/log/app.log"
+        );
+    }
+
+    #[test]
+    fn quoting_survives_the_characters_a_shell_would_eat() {
+        // Each of these would be expanded, split or swallowed by the remote
+        // shell if it were pasted in unquoted.
+        assert_eq!(posix_quote("$HOME"), "'$HOME'");
+        assert_eq!(posix_quote("*.mp4"), "'*.mp4'");
+        assert_eq!(posix_quote("a'b"), "'a'\\''b'");
+        assert_eq!(posix_quote("`id`"), "'`id`'");
+        assert_eq!(posix_quote(""), "''");
+        assert_eq!(posix_quote("plain-value_1"), "plain-value_1");
     }
 
     #[test]
